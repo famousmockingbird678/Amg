@@ -7,11 +7,11 @@ amg_data.json, and writes index.html: a phone-friendly page where you can
 change the genre / minimum score / AND-OR logic and choose which kinds of
 posts to show:
 
-  Reviews              shown if tagged with the genre OR scored >= min score
+  Reviews              shown ONLY if tagged with the genre OR scored >= min score
   Stuck in the Filter  always shown
   Album of the Month   always shown
   Year-end lists       always shown
-  Other articles       news, interviews, etc.: shown only if tagged with the genre
+  Other articles       news, interviews, anything that isn't a review: always shown
 
 (With --both, reviews need the genre tag AND the minimum score.)
 
@@ -39,7 +39,7 @@ API = "https://www.angrymetalguy.com/wp-json/wp/v2/posts"
 HEADERS = {"User-Agent": "amg-review-tracker/1.0 (personal use)"}
 RATING_RE = re.compile(r"Rating:\s*([0-5](?:\.\d+)?)", re.I)
 TAG_RE = re.compile(r"<[^>]+>")
-STATE_VERSION = 2
+STATE_VERSION = 3
 SHORT = {"filter": "SitF", "aotm": "AOTM", "yearend": "LIST", "other": "ART"}
 
 # Post types, checked in order against the post TITLE (and, for unscored posts,
@@ -70,6 +70,10 @@ def classify(title, terms, score):
             return name, None
     if score is not None:
         return "review", score
+    # A review whose rating line we couldn't read is still a review (never an
+    # "article"), so it can't slip through the review filter.
+    if any("review" in t.lower() for t in terms):
+        return "review", None
     blob = " ".join(terms)
     for name, rx in TYPE_RULES:
         if rx.search(blob):
@@ -116,15 +120,13 @@ def parse_post(p):
 
 def is_hit(r, genre, min_score, both):
     """Does a post pass the filters? Mirrors passes() in the page's JavaScript."""
+    if r["type"] != "review":
+        return True  # every non-review post is shown
     gen = bool(genre) and any(genre in t.lower() for t in r["tags"])
-    if r["type"] == "review":
-        good = r["score"] >= min_score
-        if not genre:
-            return good
-        return (good and gen) if both else (good or gen)
-    if r["type"] == "other":  # unscored articles: genre tag only
-        return gen or not genre
-    return True  # Stuck in the Filter, Album of the Month, year-end lists
+    good = r["score"] is not None and r["score"] >= min_score
+    if not genre:
+        return good
+    return (good and gen) if both else (good or gen)
 
 
 def update(state, pages, full):
@@ -224,16 +226,12 @@ for (const [key, label] of TYPES) {
 
 // Which posts pass the genre/score rules?
 //   reviews: tagged with the genre OR score >= min (AND in "both" mode)
-//   Stuck in the Filter / Album of the Month / year-end lists: always
-//   other articles: tagged with the genre only (they have no score)
+//   everything that is not a review: always shown
 function passes(r, genre, min, both) {
+  if (r.type !== "review") return true;
   const gen = !!genre && r.tags.some(t => t.toLowerCase().includes(genre));
-  if (r.type === "review") {
-    const good = r.score >= min;
-    return !genre ? good : (both ? good && gen : good || gen);
-  }
-  if (r.type === "other") return !genre || gen;
-  return true;
+  const good = r.score != null && r.score >= min;
+  return !genre ? good : (both ? good && gen : good || gen);
 }
 
 function render() {
@@ -245,9 +243,8 @@ function render() {
   try { localStorage.setItem("amgPrefs2", JSON.stringify({genre: $("genre").value, min, mode: $("mode").value, sort, types: on})); } catch (e) {}
 
   const g = genre || "any genre";
-  $("hint").textContent = "Reviews: tagged " + g + (both ? " AND " : " OR ") + min.toFixed(1) + "+. " +
-    "Stuck in the Filter, Album of the Month and year-end lists: always. " +
-    "Other articles: tagged " + g + " only.";
+  $("hint").textContent = "Reviews: only those tagged " + g + (both ? " AND rated " : " OR rated ") + min.toFixed(1) + "+. " +
+    "Everything that isn't a review is always shown.";
 
   const base = DATA.posts.filter(r => passes(r, genre, min, both) && (!q || r.title.toLowerCase().includes(q)));
   const counts = {};
@@ -263,7 +260,7 @@ function render() {
   for (const r of rows) {
     const d = document.createElement("div"); d.className = "item";
     const s = document.createElement("div");
-    if (r.type === "review") { s.className = "score"; s.textContent = r.score.toFixed(1); }
+    if (r.type === "review") { s.className = "score"; s.textContent = r.score == null ? "\\u2013" : r.score.toFixed(1); }
     else { s.className = "score small"; s.textContent = TYPES.find(t => t[0] === r.type)[2]; }
     const body = document.createElement("div");
     const a = document.createElement("a"); a.href = r.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = r.title;
@@ -318,7 +315,7 @@ def main():
     hits = [r for r in new if is_hit(r, g, args.min_score, args.both)]
     print(f"\n{len(new)} new posts this run, {len(hits)} match your filters:")
     for r in sorted(hits, key=lambda r: (r["type"] != "review", -(r["score"] or 0))):
-        label = f"{r['score']:.1f}" if r["type"] == "review" else SHORT[r["type"]]
+        label = SHORT[r["type"]] if r["type"] != "review" else (f"{r['score']:.1f}" if r["score"] is not None else "REV")
         print(f"  {label:<5} {r['date']}  {r['title']}\n        {r['url']}")
     print(f"\nWrote {out / 'index.html'}")
 
