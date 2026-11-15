@@ -9,7 +9,7 @@ posts to show:
 
   Reviews              shown ONLY if tagged with the genre OR scored >= min score
   Stuck in the Filter  always shown
-  Album of the Month   always shown
+  Album/Record of the Month (AMG: "Records o' the Month")  always shown
   Year-end lists       always shown
   Other articles       news, interviews, anything that isn't a review: always shown
 
@@ -37,48 +37,70 @@ import requests
 
 API = "https://www.angrymetalguy.com/wp-json/wp/v2/posts"
 HEADERS = {"User-Agent": "amg-review-tracker/1.0 (personal use)"}
-RATING_RE = re.compile(r"Rating:\s*([0-5](?:\.\d+)?)", re.I)
 TAG_RE = re.compile(r"<[^>]+>")
-STATE_VERSION = 3
+STATE_VERSION = 4
 SHORT = {"filter": "SitF", "aotm": "AOTM", "yearend": "LIST", "other": "ART"}
 
-# Post types, checked in order against the post TITLE (and, for unscored posts,
-# the category/tag names). Edit these patterns if something gets mis-sorted.
-TYPE_RULES = [
+# AMG now rates with WORDS (older reviews used numbers like 4.0/5.0):
+#   5.0 Iconic, 4.5 Excellent, 4.0 Great, 3.5 Very Good, 3.0 Good, 2.5 Mixed,
+#   2.0 Disappointing, 1.5 Bad, 1.0 Embarrassing, 0.5 Unlistenable
+LEVELS = {"iconic": 5.0, "excellent": 4.5, "great": 4.0, "very good": 3.5, "good": 3.0,
+          "mixed": 2.5, "disappointing": 2.0, "bad": 1.5, "embarrassing": 1.0, "unlistenable": 0.5}
+NUM_RATING_RE = re.compile(r"Rating\s*:\s*([0-5](?:\.\d)?)(?!\d)", re.I)
+WORD_RATING_RE = re.compile(
+    r"Rating\s*:\s*(very good|" + "|".join(k for k in LEVELS if k != "very good") + r")\b", re.I)
+SCORE_TAG_RE = re.compile(r"^[0-5]\.[05]$")  # AMG tags every review with its score, e.g. "3.5"
+
+# Very specific column names; these win over everything else.
+FEATURE_TITLE_RULES = [
     ("filter", re.compile(r"stuck in the filter", re.I)),
-    ("aotm", re.compile(r"album of the month|\baotm\b", re.I)),
-    ("yearend", re.compile(
-        r"year.?end|best of 20\d\d|top \d+|albums? of the year|albums of 20\d\d"
-        r"|honou?rable mentions?|staff (picks|lists?)|(best|top) [^|]{0,40}20\d\d",
-        re.I)),
+    ("aotm", re.compile(r"records?\s+o[’'`]?\s+the\s+month|album of the month|\baotm\b|\brotm\b", re.I)),
 ]
+YEAREND_RE = re.compile(
+    r"year.?end|best of 20\d\d|top \d+|albums? of the year|albums of 20\d\d"
+    r"|honou?rable mentions?|staff (picks|lists?)|(best|top) [^|]{0,40}20\d\d",
+    re.I)
+REVIEW_TITLE_RE = re.compile(r"\breview\s*$", re.I)   # AMG review titles end in "Review"
+REVIEW_TERM_RE = re.compile(r"\breviews?\b", re.I)    # category/tag "Reviews"
 
 
 def strip_html(s):
     return html.unescape(TAG_RE.sub(" ", s or "")).strip()
 
 
-def classify(title, terms, score):
-    """Return (type, score). Scores are only kept for real reviews."""
-    for name, rx in TYPE_RULES:
-        # A post with a Rating line is a review, even if the album title
-        # happens to look like a year-end list ("Best of 2008"); only the
-        # very specific column names override that.
-        if name == "yearend" and score is not None:
-            continue
+def classify(title, terms, has_rating_line):
+    """Return the post type: review, filter, aotm, yearend or other."""
+    for name, rx in FEATURE_TITLE_RULES:
         if rx.search(title):
-            return name, None
-    if score is not None:
-        return "review", score
-    # A review whose rating line we couldn't read is still a review (never an
-    # "article"), so it can't slip through the review filter.
-    if any("review" in t.lower() for t in terms):
-        return "review", None
+            return name
+    if has_rating_line or REVIEW_TITLE_RE.search(title):
+        return "review"
+    if YEAREND_RE.search(title):
+        return "yearend"
+    if any(REVIEW_TERM_RE.search(t) for t in terms):
+        return "review"
     blob = " ".join(terms)
-    for name, rx in TYPE_RULES:
+    for name, rx in FEATURE_TITLE_RULES + [("yearend", YEAREND_RE)]:
         if rx.search(blob):
-            return name, None
-    return "other", None
+            return name
+    return "other"
+
+
+def extract_score(text, terms):
+    """Numeric score of a review, or None if it can't be determined.
+    The score tag is the most reliable source; fall back to the Rating line
+    (a number for older reviews, a word like "Great" for newer ones)."""
+    for t in terms:
+        t = t.strip()
+        if SCORE_TAG_RE.match(t) and 0.5 <= float(t) <= 5.0:
+            return float(t)
+    nums = NUM_RATING_RE.findall(text)
+    if nums:
+        return float(nums[-1])
+    words = WORD_RATING_RE.findall(text)
+    if words:
+        return LEVELS[words[-1].lower()]
+    return None
 
 
 def fetch_page(page, per_page=100, after=None):
@@ -100,13 +122,14 @@ def fetch_page(page, per_page=100, after=None):
 def parse_post(p):
     title = strip_html(p["title"]["rendered"])
     text = strip_html(p["content"]["rendered"])
-    m = RATING_RE.search(text)
     terms = sorted({
         t["name"]
         for group in p.get("_embedded", {}).get("wp:term", [])
         for t in group
     })
-    kind, score = classify(title, terms, float(m.group(1)) if m else None)
+    has_line = bool(NUM_RATING_RE.search(text) or WORD_RATING_RE.search(text))
+    kind = classify(title, terms, has_line)
+    score = extract_score(text, terms) if kind == "review" else None
     return {
         "id": p["id"],
         "title": title,
@@ -204,7 +227,7 @@ h1{font-size:1.2rem;margin:.2rem 0}
 <script>
 const DATA = __DATA__;
 const $ = id => document.getElementById(id);
-const TYPES = [["review","Reviews","REV"],["filter","Stuck in the Filter","SitF"],["aotm","Album of the Month","AOTM"],["yearend","Year-end lists","LIST"],["other","Other articles","ART"]];
+const TYPES = [["review","Reviews","REV"],["filter","Stuck in the Filter","SitF"],["aotm","Records / Album of the Month","AOTM"],["yearend","Year-end lists","LIST"],["other","Other articles","ART"]];
 let saved = {};
 try { saved = JSON.parse(localStorage.getItem("amgPrefs2") || "{}"); } catch (e) {}
 const init = Object.assign({}, DATA.defaults, saved);
@@ -264,7 +287,7 @@ function render() {
     else { s.className = "score small"; s.textContent = TYPES.find(t => t[0] === r.type)[2]; }
     const body = document.createElement("div");
     const a = document.createElement("a"); a.href = r.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = r.title;
-    const t = document.createElement("div"); t.className = "tags"; t.textContent = r.date + " \\u00b7 " + r.tags.slice(0, 5).join(", ");
+    const t = document.createElement("div"); t.className = "tags"; t.textContent = r.date + " \\u00b7 " + r.tags.filter(x => !/^[0-5]\\.\\d$|^\\d{4}$|^reviews?$/i.test(x)).slice(0, 5).join(", ");
     body.append(a, t); d.append(s, body); list.append(d);
   }
 }
