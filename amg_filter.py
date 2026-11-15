@@ -7,14 +7,13 @@ amg_data.json, and writes index.html: a phone-friendly page where you can
 change the genre / minimum score / AND-OR logic and choose which kinds of
 posts to show:
 
-  Reviews              scored reviews (genre + score filters apply to these)
-  Stuck in the Filter  the regular roundup column
-  Album of the Month   monthly picks
-  Year-end lists       best-of / top albums / album of the year posts
-  Other articles       everything else (news, interviews, features...)
+  Reviews              shown if tagged with the genre OR scored >= min score
+  Stuck in the Filter  always shown
+  Album of the Month   always shown
+  Year-end lists       always shown
+  Other articles       news, interviews, etc.: shown only if tagged with the genre
 
-Non-review posts are always shown when their type is ticked; the genre and
-score filters only narrow down reviews.
+(With --both, reviews need the genre tag AND the minimum score.)
 
 Each run only fetches posts newer than the last run, so run it as often as
 you like. Needs:  pip install requests
@@ -116,14 +115,16 @@ def parse_post(p):
 
 
 def is_hit(r, genre, min_score, both):
-    """Does a post match the CLI filters? Non-reviews always do."""
-    if r["type"] != "review":
-        return True
-    good = r["score"] >= min_score
-    if not genre:
-        return good
-    gen = any(genre in t.lower() for t in r["tags"])
-    return (good and gen) if both else (good or gen)
+    """Does a post pass the filters? Mirrors passes() in the page's JavaScript."""
+    gen = bool(genre) and any(genre in t.lower() for t in r["tags"])
+    if r["type"] == "review":
+        good = r["score"] >= min_score
+        if not genre:
+            return good
+        return (good and gen) if both else (good or gen)
+    if r["type"] == "other":  # unscored articles: genre tag only
+        return gen or not genre
+    return True  # Stuck in the Filter, Album of the Month, year-end lists
 
 
 def update(state, pages, full):
@@ -188,6 +189,7 @@ h1{font-size:1.2rem;margin:.2rem 0}
 <h1>Angry Metal Guy tracker</h1>
 <div class="mut" id="meta"></div>
 <div class="types" id="types"></div>
+<div class="mut" id="hint"></div>
 <div class="ctl">
   <label>Genre tag (reviews)<input id="genre" type="text" autocapitalize="none"></label>
   <label>Min score (reviews)<input id="min" type="number" step="0.1" min="0" max="5"></label>
@@ -209,15 +211,29 @@ const on = Object.assign({review:true,filter:true,aotm:true,yearend:true,other:t
 $("genre").value = init.genre; $("min").value = init.min;
 $("mode").value = init.mode; $("sort").value = init.sort; $("q").value = "";
 
-const counts = {};
-DATA.posts.forEach(p => counts[p.type] = (counts[p.type] || 0) + 1);
 $("meta").textContent = "Last updated " + DATA.updated + " \\u00b7 " + DATA.posts.length + " posts stored";
+const labelText = {};
 for (const [key, label] of TYPES) {
   const l = document.createElement("label");
   const c = document.createElement("input"); c.type = "checkbox"; c.checked = on[key]; c.dataset.type = key;
   c.addEventListener("change", () => { on[key] = c.checked; render(); });
-  l.append(c, document.createTextNode(label + " (" + (counts[key] || 0) + ")"));
+  const span = document.createElement("span"); labelText[key] = span;
+  l.append(c, span);
   $("types").append(l);
+}
+
+// Which posts pass the genre/score rules?
+//   reviews: tagged with the genre OR score >= min (AND in "both" mode)
+//   Stuck in the Filter / Album of the Month / year-end lists: always
+//   other articles: tagged with the genre only (they have no score)
+function passes(r, genre, min, both) {
+  const gen = !!genre && r.tags.some(t => t.toLowerCase().includes(genre));
+  if (r.type === "review") {
+    const good = r.score >= min;
+    return !genre ? good : (both ? good && gen : good || gen);
+  }
+  if (r.type === "other") return !genre || gen;
+  return true;
 }
 
 function render() {
@@ -228,14 +244,16 @@ function render() {
   const q = $("q").value.trim().toLowerCase();
   try { localStorage.setItem("amgPrefs2", JSON.stringify({genre: $("genre").value, min, mode: $("mode").value, sort, types: on})); } catch (e) {}
 
-  let rows = DATA.posts.filter(r => {
-    if (!on[r.type]) return false;
-    if (q && !r.title.toLowerCase().includes(q)) return false;
-    if (r.type !== "review") return true;   // genre/score only narrow reviews
-    const good = r.score >= min;
-    const gen = genre && r.tags.some(t => t.toLowerCase().includes(genre));
-    return !genre ? good : (both ? good && gen : good || gen);
-  });
+  const g = genre || "any genre";
+  $("hint").textContent = "Reviews: tagged " + g + (both ? " AND " : " OR ") + min.toFixed(1) + "+. " +
+    "Stuck in the Filter, Album of the Month and year-end lists: always. " +
+    "Other articles: tagged " + g + " only.";
+
+  const base = DATA.posts.filter(r => passes(r, genre, min, both) && (!q || r.title.toLowerCase().includes(q)));
+  const counts = {};
+  base.forEach(r => counts[r.type] = (counts[r.type] || 0) + 1);
+  for (const [key, label] of TYPES) labelText[key].textContent = label + " (" + (counts[key] || 0) + ")";
+  let rows = base.filter(r => on[r.type]);
   rows.sort((a, b) => sort === "score"
     ? ((b.score ?? -1) - (a.score ?? -1)) || b.date.localeCompare(a.date)
     : b.date.localeCompare(a.date));
